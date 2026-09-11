@@ -67,8 +67,7 @@ void sendPongToDisplayLegacy(char who) {
 // -------- LWS TX to Display --------
 #if ENABLE_LWS_V1
 void sendPongToDisplayLws(char who) {
-  uint8_t payload[1] = {(uint8_t)who}; // opzionale: chi ha risposto
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, CMD_PONG, payload, 1);
+  lws_send_frame(DISPLAY_PORT, (uint8_t)who, CMD_PONG, nullptr, 0);
 }
 void sendPingToDisplayLws() {
   lws_send_frame(DISPLAY_PORT, ID_ROUTER, CMD_PING, nullptr, 0);
@@ -244,11 +243,13 @@ void handleDisplayFrameLws(const LwsFrame& f) {
 
   switch (cmd) {
     case CMD_PING: {
-      // rispondi pong (con who=R)
-      sendPongToDisplayLws(ID_ROUTER);
-#if ENABLE_LEGACY_PROTO
-      sendPongToDisplayLegacy(ID_ROUTER);
-#endif
+      // Il Display include nel payload il nodo da interrogare.
+      char target = f.len > 0 ? (char)f.data[0] : ID_ROUTER;
+      if (target == ID_ROUTER) {
+        sendPongToDisplayLws(ID_ROUTER);
+      } else {
+        forwardPingToNodeLegacy(target);
+      }
       break;
     }
     case 'c': { // opzionale: comando verso router
@@ -303,9 +304,6 @@ void handleNodePong(Stream& node, char nodeId, const char* dbgName, bool synthAH
     if (node.available() > 0) (void)node.read(); // consuma eventuale id
   }
 
-#if ENABLE_LEGACY_PROTO
-  sendPongToDisplayLegacy(who);
-#endif
 #if ENABLE_LWS_V1
   sendPongToDisplayLws(who);
 #endif
