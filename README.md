@@ -1,2 +1,6 @@
-# Lud-WS-Router
-Router mcu + Midi. mcu: Pi Pico
+Router tra mcu + Midi.
+
+
+
+&#x20;mcu: Pi Pico2 RP2350
+
