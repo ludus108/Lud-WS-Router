@@ -1,4 +1,7 @@
 /*  Lud-WS Router ; Pi Pico 2 rp2350
+
+	V 0.0.2
+  
  *  Bridge tra Display (LWSv1.1) e nodi (protocollo legacy).
  *
  *  LWSv1.1 frame format (lato Display):
