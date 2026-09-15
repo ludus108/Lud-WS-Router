@@ -1,13 +1,23 @@
 /*  Lud-WS Router ; Pi Pico 2 rp2350
- *  Dual mode:
- *   - Legacy protocol (storico)
- *   - LWSv1 [SENDER][CMD][LEN][PAYLOAD]&!
+ *  Bridge tra Display (LWSv1.1) e nodi (protocollo legacy).
+ *
+ *  LWSv1.1 frame format (lato Display):
+ *      [SENDER][SEQ][CMD][LEN][PAYLOAD...][CRC8][&][!]
+ *
+ *  Il Router:
+ *    - Riceve PING dal Display e li instrada ai nodi (legacy)
+ *    - Traduce le risposte dei nodi in PONG LWSv1.1 verso il Display
+ *    - Risponde ai PING indirizzati a se stesso ('R')
+ *    - Fa da ponte MIDI -> eventi LWS verso il Display
+ *
+ *  Il protocollo verso i nodi resta legacy (byte-stream con '&!').
  */
 
 #include <Arduino.h>
 #include <MIDI.h>
-#include "serial_protocol.h"   // NUOVO: condiviso con Display
+#include "serial_protocol.h"   // condiviso con Display, versione LWSv1.1
 
+// ========================== MCU IDS ==========================
 #define ID_DISPLAY  'D'
 #define ID_SYNTH_A1 'a'
 #define ID_SYNTH_A2 'b'
@@ -20,43 +30,56 @@
 #define ID_POWER    'P'
 
 // ========================== COMMAND CODES ==========================
-#define CMD_PING 'p'
-#define CMD_PONG 'P'
+#define CMD_PING       'p'
+#define CMD_PONG       'P'
+#define CMD_PARAM      'S'
+#define CMD_PARAM_REL  'R'
+#define CMD_PARAM_ACK  'A'
 
 // ========================== FEATURE FLAGS ==========================
 #define ENABLE_LEGACY_PROTO 1
 #define ENABLE_LWS_V1       1
 
-// UART mapping nel tuo progetto:
-// Serial1 -> MIDI (MIDI lib)
-// Serial2 -> Display
+// UART mapping:
+//   Serial1 -> MIDI
+//   Serial2 -> Display
 #define DISPLAY_PORT Serial2
 
-// --- 6 Porte SerialPIO ---
-SerialPIO SerialSynthA(2, 3);     // Lud-WS-SynthA_M
-SerialPIO SerialSynthB(4, 5);     // Lud-WS-SynthB
-SerialPIO SerialCtrl(6, 7);       // Lud-WS-Ctrl
-SerialPIO SerialMod(10, 11);      // Lud-WS-Mod
-SerialPIO SerialTeensy(12, 13);   // Lud-WS-Teensy
-SerialPIO SerialPower(14, 15);    // Lud-WS-Power
+// --- 6 porte SerialPIO verso i nodi ---
+SerialPIO SerialSynthA(2, 3);
+SerialPIO SerialSynthB(4, 5);
+SerialPIO SerialCtrl(6, 7);
+SerialPIO SerialMod(10, 11);
+SerialPIO SerialTeensy(12, 13);
+SerialPIO SerialPower(14, 15);
 
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
 
 byte midi_SynthA_CH = 1;
 byte midi_SynthB_CH = 2;
 
-// LWS state
+// ========================== LWS STATE ==========================
 #if ENABLE_LWS_V1
-static LwsFrame rxDisplayLws;
+static LwsParser lwsParserDisplay;     // parser verso il Display
+static uint8_t   lwsTxSeq = 0;         // SEQ rolling per i frame TX
+
+static inline uint8_t nextSeq() { return lwsTxSeq++; }
+
+// Wrapper: invia un frame LWS al Display con il prossimo SEQ.
+// 'sender' puo' essere ID_ROUTER per i messaggi del Router stesso,
+// oppure l'ID del nodo quando si spoofano le risposte (bridge trasparente).
+static inline void txLws(char sender, uint8_t cmd,
+                         const uint8_t* p = nullptr, uint8_t len = 0) {
+  lws_send_frame(DISPLAY_PORT, (uint8_t)sender, nextSeq(), cmd, p, len);
+}
 #endif
 
-// ========================== HELPERS ==========================
+// ========================== HELPERS LEGACY ==========================
 inline void writeEnd(Stream& s) {
   s.write('&');
   s.write('!');
 }
 
-// -------- Legacy TX to Display --------
 void sendPongToDisplayLegacy(char who) {
   DISPLAY_PORT.write(ID_DISPLAY);
   DISPLAY_PORT.write(CMD_PONG);
@@ -64,45 +87,57 @@ void sendPongToDisplayLegacy(char who) {
   writeEnd(DISPLAY_PORT);
 }
 
-// -------- LWS TX to Display --------
+// ========================== LWS TX VERSO IL DISPLAY ==========================
 #if ENABLE_LWS_V1
 void sendPongToDisplayLws(char who) {
-  lws_send_frame(DISPLAY_PORT, (uint8_t)who, CMD_PONG, nullptr, 0);
+  // 'who' = ID del nodo che ha risposto (spoofing del SENDER)
+  txLws(who, CMD_PONG, nullptr, 0);
 }
+
 void sendPingToDisplayLws() {
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, CMD_PING, nullptr, 0);
+  txLws(ID_ROUTER, CMD_PING, nullptr, 0);
 }
+
 void sendStatusToDisplayLws(const char* txt) {
   uint8_t len = (uint8_t)min((int)strlen(txt), 250);
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, 's', (const uint8_t*)txt, len);
+  txLws(ID_ROUTER, 's', (const uint8_t*)txt, len);
 }
+
 void sendErrorToDisplayLws(const char* txt) {
   uint8_t len = (uint8_t)min((int)strlen(txt), 250);
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, 'e', (const uint8_t*)txt, len);
+  txLws(ID_ROUTER, 'e', (const uint8_t*)txt, len);
 }
+
 void sendCCToDisplayLws(uint8_t cc, uint8_t val) {
   uint8_t p[2] = {cc, val};
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, 'c', p, 2);
+  txLws(ID_ROUTER, 'c', p, 2);
 }
+
 void sendNoteToDisplayLws(uint8_t onoff, uint8_t pitch, uint8_t vel) {
   uint8_t p[3] = {onoff, pitch, vel};
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, 'n', p, 3);
+  txLws(ID_ROUTER, 'n', p, 3);
 }
+
 void sendBendToDisplayLws(int32_t bend) {
   uint8_t p[4];
   lws_pack_i32_le(bend, p);
-  lws_send_frame(DISPLAY_PORT, ID_ROUTER, 'b', p, 4);
+  txLws(ID_ROUTER, 'b', p, 4);
+}
+
+// ACK per un CMD_PARAM_REL ricevuto dal Display
+void sendParamAckToDisplayLws(uint8_t ackedSeq, uint8_t ackedCmd) {
+  uint8_t p[2] = { ackedSeq, ackedCmd };
+  txLws(ID_ROUTER, CMD_PARAM_ACK, p, 2);
 }
 #endif
 
-// ========================== MIDI -> SYNTH (legacy invariato) ==========================
+// ========================== MIDI -> SYNTH (legacy + telemetria LWS) ==========================
 void sendCC_A(byte number, byte value) {
   SerialSynthA.write('m');
   SerialSynthA.write('c');
   SerialSynthA.write(number);
   SerialSynthA.write(value);
   writeEnd(SerialSynthA);
-
 #if ENABLE_LWS_V1
   sendCCToDisplayLws(number, value);
 #endif
@@ -114,7 +149,6 @@ void sendCC_B(byte number, byte value) {
   SerialSynthB.write(number);
   SerialSynthB.write(value);
   writeEnd(SerialSynthB);
-
 #if ENABLE_LWS_V1
   sendCCToDisplayLws(number, value);
 #endif
@@ -125,7 +159,6 @@ void sendBenderA(int bend) {
   SerialSynthA.write('b');
   SerialSynthA.write((uint8_t*)&bend, 4);
   writeEnd(SerialSynthA);
-
 #if ENABLE_LWS_V1
   sendBendToDisplayLws((int32_t)bend);
 #endif
@@ -136,7 +169,6 @@ void sendBenderB(int bend) {
   SerialSynthB.write('b');
   SerialSynthB.write((uint8_t*)&bend, 4);
   writeEnd(SerialSynthB);
-
 #if ENABLE_LWS_V1
   sendBendToDisplayLws((int32_t)bend);
 #endif
@@ -144,11 +176,10 @@ void sendBenderB(int bend) {
 
 void sendNoteOnOffA(byte status, byte pitch, byte velocity) {
   SerialSynthA.write('m');
-  SerialSynthA.write(status);   // 0 noteOff, 1 noteOn
+  SerialSynthA.write(status);
   SerialSynthA.write(pitch);
-  SerialSynthA.write(velocity); // FIX bug
+  SerialSynthA.write(velocity);
   writeEnd(SerialSynthA);
-
 #if ENABLE_LWS_V1
   sendNoteToDisplayLws(status, pitch, velocity);
 #endif
@@ -156,64 +187,67 @@ void sendNoteOnOffA(byte status, byte pitch, byte velocity) {
 
 void sendNoteOnOffB(byte status, byte pitch, byte velocity) {
   SerialSynthB.write('m');
-  SerialSynthB.write(status);   // 0 noteOff, 1 noteOn
+  SerialSynthB.write(status);
   SerialSynthB.write(pitch);
-  SerialSynthB.write(velocity); // FIX bug
+  SerialSynthB.write(velocity);
   writeEnd(SerialSynthB);
-
 #if ENABLE_LWS_V1
   sendNoteToDisplayLws(status, pitch, velocity);
 #endif
 }
 
 void handleNoteOn(byte channel, byte pitch, byte velocity) {
-  if (channel == midi_SynthA_CH) sendNoteOnOffA(1, pitch, velocity);
+  if (channel == midi_SynthA_CH)      sendNoteOnOffA(1, pitch, velocity);
   else if (channel == midi_SynthB_CH) sendNoteOnOffB(1, pitch, velocity);
 }
 void handleNoteOff(byte channel, byte pitch, byte velocity) {
-  if (channel == midi_SynthA_CH) sendNoteOnOffA(0, pitch, velocity);
+  if (channel == midi_SynthA_CH)      sendNoteOnOffA(0, pitch, velocity);
   else if (channel == midi_SynthB_CH) sendNoteOnOffB(0, pitch, velocity);
 }
 void handlePitchBend(byte channel, int bend) {
-  if (channel == midi_SynthA_CH) sendBenderA(bend);
+  if (channel == midi_SynthA_CH)      sendBenderA(bend);
   else if (channel == midi_SynthB_CH) sendBenderB(bend);
 }
 void handleControlChange(byte channel, byte number, byte value) {
-  if (channel == midi_SynthA_CH) sendCC_A(number, value);
+  if (channel == midi_SynthA_CH)      sendCC_A(number, value);
   else if (channel == midi_SynthB_CH) sendCC_B(number, value);
 }
 
-// ========================== Legacy routing ==========================
+// ========================== LEGACY ROUTING (verso i nodi) ==========================
 void forwardPingToNodeLegacy(char nodeId) {
   switch (nodeId) {
     case ID_POWER:
-      SerialPower.write(CMD_PING); SerialPower.write(ID_POWER); writeEnd(SerialPower); break;
+      SerialPower.write(CMD_PING);    SerialPower.write(ID_POWER);    writeEnd(SerialPower);    break;
     case ID_SYNTH_A1:
-      SerialSynthA.write(CMD_PING); SerialSynthA.write('a'); writeEnd(SerialSynthA); break;
+      SerialSynthA.write(CMD_PING);   SerialSynthA.write('a');        writeEnd(SerialSynthA);   break;
     case ID_SYNTH_A2:
-      SerialSynthA.write(CMD_PING); SerialSynthA.write('b'); writeEnd(SerialSynthA); break;
+      SerialSynthA.write(CMD_PING);   SerialSynthA.write('b');        writeEnd(SerialSynthA);   break;
     case ID_SYNTH_A3:
-      SerialSynthA.write(CMD_PING); SerialSynthA.write('c'); writeEnd(SerialSynthA); break;
+      SerialSynthA.write(CMD_PING);   SerialSynthA.write('c');        writeEnd(SerialSynthA);   break;
     case ID_SYNTH_B:
-      SerialSynthB.write(CMD_PING); SerialSynthB.write(ID_SYNTH_B); writeEnd(SerialSynthB); break;
+      SerialSynthB.write(CMD_PING);   SerialSynthB.write(ID_SYNTH_B); writeEnd(SerialSynthB);   break;
     case ID_ROUTER:
+      // Risposta diretta: e' il Router stesso
       sendPongToDisplayLegacy(ID_ROUTER);
 #if ENABLE_LWS_V1
       sendPongToDisplayLws(ID_ROUTER);
 #endif
       break;
     case ID_TEENSY:
-      SerialTeensy.write(CMD_PING); SerialTeensy.write(ID_TEENSY); writeEnd(SerialTeensy); break;
+      SerialTeensy.write(CMD_PING);   SerialTeensy.write(ID_TEENSY);  writeEnd(SerialTeensy);   break;
     case ID_MOD:
-      SerialMod.write(CMD_PING); SerialMod.write(ID_MOD); writeEnd(SerialMod); break;
+      SerialMod.write(CMD_PING);      SerialMod.write(ID_MOD);        writeEnd(SerialMod);      break;
     case ID_CTRL:
-      SerialCtrl.write(CMD_PING); SerialCtrl.write(ID_CTRL); writeEnd(SerialCtrl); break;
+      SerialCtrl.write(CMD_PING);     SerialCtrl.write(ID_CTRL);      writeEnd(SerialCtrl);     break;
     default: break;
   }
 }
 
-void handleDisplayInputLegacyByte(uint8_t b) {
+// ========================== LEGACY RX from Display ==========================
+// NOTA: usato solo come fallback se il parser LWS non ha sincronizzato.
+// Con LWSv1.1 attivo, tutti i frame dovrebbero passare dal parser.
 #if ENABLE_LEGACY_PROTO
+void handleDisplayInputLegacyByte(uint8_t b) {
   char p = (char)b;
   if (p == CMD_PING) {
     if (DISPLAY_PORT.available() > 0) {
@@ -233,10 +267,10 @@ void handleDisplayInputLegacyByte(uint8_t b) {
   } else if (p == ID_POWER) {
     if (DISPLAY_PORT.available() > 0) SerialPower.write(DISPLAY_PORT.read());
   }
-#endif
 }
+#endif
 
-// ========================== LWS RX from Display ==========================
+// ========================== LWS RX FROM DISPLAY ==========================
 #if ENABLE_LWS_V1
 void handleDisplayFrameLws(const LwsFrame& f) {
   const char cmd = (char)f.cmd;
@@ -252,13 +286,31 @@ void handleDisplayFrameLws(const LwsFrame& f) {
       }
       break;
     }
-    case 'c': { // opzionale: comando verso router
-      // payload [cc,val]
-      if (f.len >= 2) {
-        // se vuoi applicare qualcosa nel router, fallo qui
-      }
+
+    case CMD_PARAM: {
+      // Fire-and-forget: il Router non ha parametri propri, ma se il
+      // Display indirizza un param verso un nodo, lo inoltriamo via legacy.
+      // (Formato legacy per i param verso i nodi non e' ancora definito,
+      //  quindi per ora logghiamo soltanto.)
+      Serial.printf("[LWS] PARAM target=%c key=%c val=%u (dropped)\n",
+                    f.len >= 1 ? (char)f.data[0] : '?',
+                    f.len >= 2 ? (char)f.data[1] : '?',
+                    f.len >= 3 ? f.data[2] : 0);
       break;
     }
+
+    case CMD_PARAM_REL: {
+      // Reliable: il Router conferma con ACK (anche se non applica nulla).
+      Serial.printf("[LWS] PARAM_REL seq=%u target=%c key=%c val=%u\n",
+                    f.seq,
+                    f.len >= 1 ? (char)f.data[0] : '?',
+                    f.len >= 2 ? (char)f.data[1] : '?',
+                    f.len >= 3 ? f.data[2] : 0);
+      sendParamAckToDisplayLws(f.seq, f.cmd);
+      break;
+    }
+
+    case 'c':
     case 'n':
     case 'b':
     case 's':
@@ -266,6 +318,7 @@ void handleDisplayFrameLws(const LwsFrame& f) {
     case 'a':
     case CMD_PONG:
     default:
+      // Comandi non indirizzati al Router: ignora.
       break;
   }
 }
@@ -276,19 +329,25 @@ void pollDisplayPort() {
     uint8_t b = (uint8_t)DISPLAY_PORT.read();
 
 #if ENABLE_LWS_V1
-    if (lws_parse_byte(b, rxDisplayLws)) {
-      handleDisplayFrameLws(rxDisplayLws);
+    LwsFrame f;
+    if (lwsParserDisplay.feed(b, f)) {
+      handleDisplayFrameLws(f);
       continue;
     }
+    // NOTA: in LWSv1.1 il parser consuma il byte ad ogni chiamata e ritorna
+    // true solo a frame completo. Non c'e' modo di "ripescare" il byte per
+    // il legacy handler. Se hai bisogno del dual-mode reale, usa due porte
+    // separate o un flag di modalita' negoziato all'avvio.
 #endif
-
-    // fallback legacy sul singolo byte
-    handleDisplayInputLegacyByte(b);
   }
 }
 
-// ========================== NODES -> Display pong ==========================
-void handleNodePong(Stream& node, char nodeId, const char* dbgName, bool synthAHasSubId = false) {
+// ========================== NODES -> DISPLAY PONG ==========================
+// I nodi rispondono con protocollo legacy: 'p' + [sub_id?]
+// Il Router traduce in LWS PONG verso il Display, spoofando il SENDER
+// con l'ID del nodo che ha effettivamente risposto.
+void handleNodePong(Stream& node, char nodeId, const char* dbgName,
+                    bool synthAHasSubId = false) {
   if (!node.available()) return;
 
   char p = (char)node.read();
@@ -301,18 +360,22 @@ void handleNodePong(Stream& node, char nodeId, const char* dbgName, bool synthAH
       if (sub == 'a' || sub == 'b' || sub == 'c') who = sub;
     }
   } else {
-    if (node.available() > 0) (void)node.read(); // consuma eventuale id
+    if (node.available() > 0) (void)node.read();
   }
 
 #if ENABLE_LWS_V1
   sendPongToDisplayLws(who);
+  (void)dbgName;
+#else
+  sendPongToDisplayLegacy(who);
+  (void)dbgName;
 #endif
 }
 
 // ========================== SETUP / LOOP ==========================
 void setup() {
-  Serial.begin(115200);       // debug USB
-  DISPLAY_PORT.begin(115200); // Display UART
+  Serial.begin(115200);        // debug USB
+  DISPLAY_PORT.begin(115200);  // Display UART
 
   MIDI.begin(MIDI_CHANNEL_OMNI);
   MIDI.turnThruOff();
@@ -329,17 +392,23 @@ void setup() {
   SerialPower.begin(115200);
 
 #if ENABLE_LWS_V1
-  sendStatusToDisplayLws("Router boot");
+  // Reset esplicito del parser e del contatore SEQ
+  lwsParserDisplay.reset();
+  lwsTxSeq = 0;
+
+  sendStatusToDisplayLws("Router boot (LWSv1.1)");
 #endif
+
+  Serial.println("[Router] LWSv1.1 ready");
 }
 
 void loop() {
   MIDI.read();
 
-  // input da Display (LWS + legacy)
+  // Input dal Display (LWS parser prioritario)
   pollDisplayPort();
 
-  // input dai nodi
+  // Input dai nodi (legacy -> LWS PONG)
   handleNodePong(SerialSynthA, ID_SYNTH_A1, "SerialSynthA", true);
   handleNodePong(SerialSynthB, ID_SYNTH_B,  "SerialSynthB");
   handleNodePong(SerialCtrl,   ID_CTRL,     "SerialCtrl");
@@ -348,7 +417,7 @@ void loop() {
   handleNodePong(SerialPower,  ID_POWER,    "SerialPower");
 
 #if ENABLE_LWS_V1
-  // heartbeat opzionale router->display
+  // Heartbeat Router -> Display (1 Hz)
   static uint32_t tPing = 0;
   if (millis() - tPing >= 1000) {
     tPing = millis();
