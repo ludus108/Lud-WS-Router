@@ -1,5 +1,5 @@
-#ifndef COMUNICAZIONI_H
-#define COMUNICAZIONI_H
+#ifndef COMUNICAZIONI_MCU_H
+#define COMUNICAZIONI_MCU_H
 
 /*
  * ============================================================================
@@ -298,4 +298,4 @@ static inline void lws_reset() {
     g_tx_seq = 0;
 }
 
-#endif
+#endif  // COMUNICAZIONI_MCU_H
