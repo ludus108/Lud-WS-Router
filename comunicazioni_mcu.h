@@ -3,55 +3,48 @@
 
 /*
  * ============================================================================
- *  comunicazioni.h — LWSv1.1 (LUD-WS Serial Protocol v1.1) — LATO MCU
+ *  comunicazioni_mcu.h — LWSv1.1 — LATO MCU
  * ============================================================================
  *
- *  Questo file è il gemello di comunicazioni.h lato Display. Va incluso nel
- *  progetto di ogni nodo (Router, Synth A1/A2/A3, Synth B, Ctrl, Mod, Teensy,
- *  Power) e usa lo STESSO serial_protocol.h condiviso.
+ *  Gemello di comunicazioni.h lato Display. Va incluso in ogni nodo
+ *  (Router, Synth A1/A2/A3, Synth B, Ctrl, Mod, Teensy, Power) e usa lo
+ *  STESSO serial_protocol.h condiviso.
  *
- *  CHANGELOG rispetto a LWSv1:
+ *  CHANGELOG
  *  ---------------------------------------------------------------------------
- *  [10.1] FIX  : ID_POWER aggiunto alla mappa MCU (lato Display). Lato MCU non
- *                cambia nulla, ma il nodo Power ora può essere riconosciuto.
+ *  [10.1] FIX : ID_POWER aggiunto alla mappa MCU (lato Display).
+ *  [10.2] ADD : CRC-8/ATM nel frame.
+ *  [10.3] ADD : SEQ + protocollo ibrido di ACK.
+ *  [10.4] ADD : 3 comandi MIDI (CMD_MIDI_CC/NOTE/BEND) + callbacks.
+ *  [10.4] FIX : accetta frame sia da ID_DISPLAY che da ID_ROUTER.
+ *               Il Router e' l'unico che puo' inviare comandi operativi
+ *               (PING, MIDI) perche' e' il bridge verso i nodi.
  *
- *  [10.2] ADD  : CRC-8/ATM (poly 0x07, init 0x00) nel frame.
- *                Frame con CRC errato vengono scartati silenziosamente.
- *
- *  [10.3] ADD  : SEQ byte + protocollo ibrido di ACK:
- *                  - CMD_PING      -> risposta PONG (affidabile)
- *                  - CMD_PARAM     -> fire-and-forget (potenziometri, alta freq)
- *                  - CMD_PARAM_REL -> ACK obbligatorio (config, comandi critici)
- *                Coda pending da 8 slot, timeout 300 ms, 3 retry.
- *
- *  Formato frame LWSv1.1 (condiviso con il Display):
+ *  Formato frame LWSv1.1:
  *      [SENDER][SEQ][CMD][LEN][PAYLOAD...][CRC8][&][!]
  *
- *  CONFIGURAZIONE (definisci queste macro PRIMA di includere il file,
- *  oppure modificale qui sotto nel blocco "Configurazione nodo"):
- *      MCU_ID             : ID char del nodo (es. 'a', 'B', 'R', 'M', ...)
- *      LWS_SERIAL         : Stream usato per LWS (default: Serial1)
- *      LWS_DEBUG          : Stream usato per log di debug (default: Serial)
+ *  CONFIGURAZIONE (prima dell'include):
+ *      MCU_ID      : ID char del nodo (es. 'a', 'B', 'C', ...)
+ *      LWS_SERIAL  : Stream LWS (default: Serial1)
+ *      LWS_DEBUG   : Stream debug (default: Serial)
  *
  *  USO TIPICO:
  *
- *      // In setup():
- *      lws_set_callbacks(on_param_set, on_error_received);
- *      LWS_SERIAL.begin(115200);
+ *      void on_param(char t, char k, uint8_t v) { ... }
+ *      void on_err(const char *m) { ... }
+ *      void on_cc(uint8_t cc, uint8_t val) { ... }
+ *      void on_note(uint8_t on, uint8_t pitch, uint8_t vel) { ... }
+ *      void on_bend(int32_t b) { ... }
  *
- *      // Nel loop():
- *      lws_mcu_poll();            // gestisce RX e retry ACK
- *      // ...
- *      if (pot_changed()) {
- *          lws_send_param('A', 'g', cutOff_value);          // fire-and-forget
- *      }
- *      if (save_requested()) {
- *          lws_send_param_reliable('A', 'a', wave_mode);    // con ACK
+ *      void setup() {
+ *          LWS_SERIAL.begin(115200);
+ *          lws_set_callbacks(on_param, on_err);
+ *          lws_set_midi_callbacks(on_cc, on_note, on_bend);
  *      }
  *
- *  NOTE:
- *      - I byte '&' (0x26) e '!' (0x21) non devono comparire nel payload.
- *      - lws_mcu_poll() DEVE essere chiamata ad ogni iterazione di loop().
+ *      void loop() {
+ *          lws_mcu_poll();
+ *      }
  * ============================================================================
  */
 
@@ -59,10 +52,8 @@
 #include "serial_protocol.h"
 
 // ========================== CONFIGURAZIONE NODO ==========================
-// Sovrascrivibili dal progetto che include questo header.
-
 #ifndef MCU_ID
-#define MCU_ID 'x'          // <-- OGNI NODO DEVE DEFINIRLO (es. 'a', 'B', 'R')
+#define MCU_ID 'x'
 #endif
 
 #ifndef LWS_SERIAL
@@ -73,18 +64,9 @@
 #define LWS_DEBUG Serial
 #endif
 
-// ========================== COMANDI (devono combaciare col Display) ==========================
-#define CMD_PING        'p'
-#define CMD_PONG        'P'
-#define CMD_PARAM       'S'
-#define CMD_PARAM_REL   'R'
-#define CMD_PARAM_ACK   'A'
-#define CMD_GET_PARAM   'G'
-#define CMD_ERROR       'E'
-#define CMD_STATUS      'Z'
-
-// ID del Display (unico interlocutore del nodo)
+// ========================== IDENTIFICATORI ==========================
 #define ID_DISPLAY      'D'
+#define ID_ROUTER       'R'
 
 // ========================== SEQ + PENDING ACK ==========================
 static uint8_t g_tx_seq = 0;
@@ -117,17 +99,17 @@ static LwsPendingAck* lws_pending_alloc() {
 }
 
 // ========================== CALLBACKS UTENTE ==========================
-// Implementa queste funzioni nel tuo sketch .ino e passale a lws_set_callbacks().
-//   on_param : chiamata quando arriva CMD_PARAM o CMD_PARAM_REL dal Display.
-//              'target' e' 'A' o 'B', 'key' e' la lettera del parametro,
-//              'value' e' il nuovo valore (0..255).
-//   on_error : chiamata quando arriva CMD_ERROR (stringa terminata da '\0').
-
 typedef void (*lws_param_cb_t)(char target, char key, uint8_t value);
 typedef void (*lws_error_cb_t)(const char *msg);
+typedef void (*lws_midi_cc_cb_t)(uint8_t cc, uint8_t value);
+typedef void (*lws_midi_note_cb_t)(uint8_t onoff, uint8_t pitch, uint8_t vel);
+typedef void (*lws_midi_bend_cb_t)(int32_t bend);
 
-static lws_param_cb_t g_param_cb = nullptr;
-static lws_error_cb_t g_error_cb = nullptr;
+static lws_param_cb_t     g_param_cb     = nullptr;
+static lws_error_cb_t     g_error_cb     = nullptr;
+static lws_midi_cc_cb_t   g_midi_cc_cb   = nullptr;
+static lws_midi_note_cb_t g_midi_note_cb = nullptr;
+static lws_midi_bend_cb_t g_midi_bend_cb = nullptr;
 
 static inline void lws_set_callbacks(lws_param_cb_t on_param,
                                      lws_error_cb_t on_error) {
@@ -135,24 +117,24 @@ static inline void lws_set_callbacks(lws_param_cb_t on_param,
     g_error_cb = on_error;
 }
 
+static inline void lws_set_midi_callbacks(lws_midi_cc_cb_t   on_cc,
+                                          lws_midi_note_cb_t on_note,
+                                          lws_midi_bend_cb_t on_bend) {
+    g_midi_cc_cb   = on_cc;
+    g_midi_note_cb = on_note;
+    g_midi_bend_cb = on_bend;
+}
+
 // ========================== TX ==========================
-// Risposta al PING
 static void lws_send_pong() {
     lws_send_frame(LWS_SERIAL, MCU_ID, lws_next_seq(), CMD_PONG, nullptr, 0);
 }
 
-// Fire-and-forget: usa per potenziometri, slider, alta frequenza.
-// Se un frame si perde, il successivo (fra 33 ms) lo sovrascrive.
-//   target : 'A' o 'B'  (banco del synth di appartenenza del nodo)
-//   key    : lettera del parametro (vedi mappe in globals.h del Display)
-//   value  : 0..255
 static void lws_send_param(char target, char key, uint8_t value) {
     uint8_t p[3] = { (uint8_t)target, (uint8_t)key, value };
     lws_send_frame(LWS_SERIAL, MCU_ID, lws_next_seq(), CMD_PARAM, p, 3);
 }
 
-// Reliable: usa per comandi critici (config, load preset, cambio wave mode).
-// Entra in coda pending, retry fino a 3 volte, timeout 300 ms.
 static void lws_send_param_reliable(char target, char key, uint8_t value) {
     uint8_t p[3] = { (uint8_t)target, (uint8_t)key, value };
     uint8_t seq  = lws_next_seq();
@@ -173,17 +155,15 @@ static void lws_send_param_reliable(char target, char key, uint8_t value) {
     lws_send_frame(LWS_SERIAL, MCU_ID, seq, CMD_PARAM_REL, p, 3);
 }
 
-// Errore verso il Display: stringa breve (max 62 char)
 static void lws_send_error(const char *msg) {
     uint8_t p[64];
     size_t l = strlen(msg);
     if (l > 62) l = 62;
-    p[0] = (uint8_t)ID_DISPLAY;          // target del messaggio
+    p[0] = (uint8_t)ID_DISPLAY;
     memcpy(&p[1], msg, l);
     lws_send_frame(LWS_SERIAL, MCU_ID, lws_next_seq(), CMD_ERROR, p, 1 + (uint8_t)l);
 }
 
-// ACK per un frame CMD_PARAM_REL ricevuto
 static void lws_send_ack(uint8_t acked_seq, uint8_t acked_cmd) {
     uint8_t p[2] = { acked_seq, acked_cmd };
     lws_send_frame(LWS_SERIAL, MCU_ID, lws_next_seq(), CMD_PARAM_ACK, p, 2);
@@ -193,12 +173,12 @@ static void lws_send_ack(uint8_t acked_seq, uint8_t acked_cmd) {
 static LwsParser lwsParser;
 
 static void lws_process_frame(const LwsFrame &f) {
-    // Accettiamo frame solo dal Display (il nodo non parla con altri nodi)
-    if ((char)f.sender != ID_DISPLAY) return;
+    // Accettiamo frame dal Display (forwarding) e dal Router (PING, MIDI).
+    char s = (char)f.sender;
+    if (s != ID_DISPLAY && s != ID_ROUTER) return;
 
     switch ((char)f.cmd) {
         case CMD_PING: {
-            // Il payload contiene l'ID del target: rispondi solo se sei tu
             if (f.len >= 1 && (char)f.data[0] == MCU_ID) {
                 lws_send_pong();
             }
@@ -206,7 +186,6 @@ static void lws_process_frame(const LwsFrame &f) {
         }
 
         case CMD_PARAM: {
-            // Fire-and-forget: applica e basta
             if (f.len >= 3 && g_param_cb) {
                 g_param_cb((char)f.data[0], (char)f.data[1], f.data[2]);
             }
@@ -214,7 +193,6 @@ static void lws_process_frame(const LwsFrame &f) {
         }
 
         case CMD_PARAM_REL: {
-            // Reliable: applica e invia ACK
             if (f.len >= 3) {
                 if (g_param_cb) {
                     g_param_cb((char)f.data[0], (char)f.data[1], f.data[2]);
@@ -225,7 +203,6 @@ static void lws_process_frame(const LwsFrame &f) {
         }
 
         case CMD_PARAM_ACK: {
-            // ACK di un nostro CMD_PARAM_REL: chiudi il pending
             if (f.len >= 2) {
                 uint8_t acked_seq = f.data[0];
                 uint8_t acked_cmd = f.data[1];
@@ -239,8 +216,28 @@ static void lws_process_frame(const LwsFrame &f) {
             break;
         }
 
+        case CMD_MIDI_CC: {
+            if (f.len >= 2 && g_midi_cc_cb) {
+                g_midi_cc_cb(f.data[0], f.data[1]);
+            }
+            break;
+        }
+
+        case CMD_MIDI_NOTE: {
+            if (f.len >= 3 && g_midi_note_cb) {
+                g_midi_note_cb(f.data[0], f.data[1], f.data[2]);
+            }
+            break;
+        }
+
+        case CMD_MIDI_BEND: {
+            if (f.len >= 4 && g_midi_bend_cb) {
+                g_midi_bend_cb(lws_unpack_i32_le(&f.data[0]));
+            }
+            break;
+        }
+
         case CMD_ERROR: {
-            // Errore dal Display
             char msg[64] = {0};
             if (f.len >= 2) {
                 size_t l = f.len - 1;
@@ -258,7 +255,6 @@ static void lws_process_frame(const LwsFrame &f) {
     }
 }
 
-// Da chiamare nel loop() ogni volta che ci sono byte disponibili
 static inline void lws_mcu_read() {
     while (LWS_SERIAL.available() > 0) {
         uint8_t b = (uint8_t)LWS_SERIAL.read();
@@ -268,7 +264,6 @@ static inline void lws_mcu_read() {
 }
 
 // ========================== RETRY PENDING ==========================
-// Da chiamare nel loop() ad ogni iterazione (dopo lws_mcu_read()).
 static inline void lws_mcu_poll() {
     lws_mcu_read();
 
@@ -291,7 +286,6 @@ static inline void lws_mcu_poll() {
     }
 }
 
-// ========================== UTILITY ==========================
 static inline void lws_reset() {
     memset(g_pending, 0, sizeof(g_pending));
     lwsParser.reset();

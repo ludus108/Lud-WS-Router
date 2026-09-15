@@ -1,25 +1,30 @@
 /*  Lud-WS Router ; Pi Pico 2 rp2350
 
-	V 0.0.2
-  
- *  Bridge tra Display (LWSv1.1) e nodi (protocollo legacy).
+    V 0.0.3
+
+ *  Bridge tra Display (LWSv1.1) e nodi.
  *
- *  LWSv1.1 frame format (lato Display):
+ *  Stato attuale:
+ *    - Teensy      : LWSv1.1 nativo  -> bridged as-is verso il Display
+ *    - Altri nodi  : legacy '&!'     -> tradotti in PONG LWS dal Router
+ *    - Router      : risponde ai PING indirizzati a se stesso ('R')
+ *    - MIDI        : genera telemetria LWS verso il Display
+ *
+ *  LWSv1.1 frame format:
  *      [SENDER][SEQ][CMD][LEN][PAYLOAD...][CRC8][&][!]
  *
- *  Il Router:
- *    - Riceve PING dal Display e li instrada ai nodi (legacy)
- *    - Traduce le risposte dei nodi in PONG LWSv1.1 verso il Display
- *    - Risponde ai PING indirizzati a se stesso ('R')
- *    - Fa da ponte MIDI -> eventi LWS verso il Display
- *
- *  Il protocollo verso i nodi resta legacy (byte-stream con '&!').
+ *  Il Router e' un bridge trasparente per i nodi LWS: i frame passano
+ *  invariati (SENDER, SEQ, CMD, PAYLOAD originali). Solo i frame dei nodi
+ *  legacy vengono tradotti.
  */
 
 #include <Arduino.h>
 #include <MIDI.h>
 #include "serial_protocol.h"   // condiviso con Display, versione LWSv1.1
 
+// Lud-WS-Router.ino
+#define MCU_ID 'R'
+#include "comunicazioni_mcu.h"
 // ========================== MCU IDS ==========================
 #define ID_DISPLAY  'D'
 #define ID_SYNTH_A1 'a'
@@ -64,13 +69,14 @@ byte midi_SynthB_CH = 2;
 // ========================== LWS STATE ==========================
 #if ENABLE_LWS_V1
 static LwsParser lwsParserDisplay;     // parser verso il Display
-static uint8_t   lwsTxSeq = 0;         // SEQ rolling per i frame TX
+static uint8_t   lwsTxSeq = 0;         // SEQ rolling per i frame TX del Router
 
 static inline uint8_t nextSeq() { return lwsTxSeq++; }
 
-// Wrapper: invia un frame LWS al Display con il prossimo SEQ.
-// 'sender' puo' essere ID_ROUTER per i messaggi del Router stesso,
-// oppure l'ID del nodo quando si spoofano le risposte (bridge trasparente).
+// Wrapper: invia un frame LWS al Display con il prossimo SEQ del Router.
+// Usato solo per frame GENERATI dal Router (PONG, status, telemetria MIDI).
+// Per i frame INOLTRATI da nodi LWS si usa lws_send_frame() diretto,
+// per preservare SENDER/SEQ originali.
 static inline void txLws(char sender, uint8_t cmd,
                          const uint8_t* p = nullptr, uint8_t len = 0) {
   lws_send_frame(DISPLAY_PORT, (uint8_t)sender, nextSeq(), cmd, p, len);
@@ -127,7 +133,7 @@ void sendBendToDisplayLws(int32_t bend) {
   txLws(ID_ROUTER, 'b', p, 4);
 }
 
-// ACK per un CMD_PARAM_REL ricevuto dal Display
+// ACK per un CMD_PARAM_REL ricevuto dal Display e diretto al Router
 void sendParamAckToDisplayLws(uint8_t ackedSeq, uint8_t ackedCmd) {
   uint8_t p[2] = { ackedSeq, ackedCmd };
   txLws(ID_ROUTER, CMD_PARAM_ACK, p, 2);
@@ -216,7 +222,34 @@ void handleControlChange(byte channel, byte number, byte value) {
   else if (channel == midi_SynthB_CH) sendCC_B(number, value);
 }
 
-// ========================== LEGACY ROUTING (verso i nodi) ==========================
+// ========================== NODE ROUTING TABLE ==========================
+// Identifica se un nodo parla LWS nativo (true) o legacy (false).
+// Man mano che si migrano i nodi, aggiungere qui il loro ID.
+static bool isLwsNode(char id) {
+#if ENABLE_LWS_V1
+  return (id == ID_TEENSY);
+#else
+  (void)id;
+  return false;
+#endif
+}
+
+// Restituisce la porta fisica associata a un ID nodo.
+static Stream* portForNode(char id) {
+  switch (id) {
+    case ID_SYNTH_A1:
+    case ID_SYNTH_A2:
+    case ID_SYNTH_A3: return &SerialSynthA;
+    case ID_SYNTH_B:  return &SerialSynthB;
+    case ID_CTRL:     return &SerialCtrl;
+    case ID_MOD:      return &SerialMod;
+    case ID_TEENSY:   return &SerialTeensy;
+    case ID_POWER:    return &SerialPower;
+    default:          return nullptr;
+  }
+}
+
+// ========================== LEGACY PING VERSO NODI ==========================
 void forwardPingToNodeLegacy(char nodeId) {
   switch (nodeId) {
     case ID_POWER:
@@ -246,9 +279,97 @@ void forwardPingToNodeLegacy(char nodeId) {
   }
 }
 
-// ========================== LEGACY RX from Display ==========================
-// NOTA: usato solo come fallback se il parser LWS non ha sincronizzato.
-// Con LWSv1.1 attivo, tutti i frame dovrebbero passare dal parser.
+// ========================== PING DISPATCHER ==========================
+// Decide se mandare un PING LWS o legacy a seconda del tipo di nodo.
+#if ENABLE_LWS_V1
+void forwardPingToNode(char target) {
+  if (target == ID_ROUTER) {
+    sendPongToDisplayLws(ID_ROUTER);
+    return;
+  }
+  Stream *p = portForNode(target);
+  if (!p) return;
+
+  if (isLwsNode(target)) {
+    // LWS PING: [target_id] come payload
+    uint8_t payload[1] = { (uint8_t)target };
+    lws_send_frame(*p, ID_ROUTER, nextSeq(), CMD_PING, payload, 1);
+  } else {
+    forwardPingToNodeLegacy(target);
+  }
+}
+
+// ========================== PARAM DISPATCHER ==========================
+// Inoltra un CMD_PARAM / CMD_PARAM_REL dal Display verso il nodo target.
+// Per nodi LWS: frame inoltrato invariato (stesso SENDER/SEQ del Display).
+// Per nodi legacy: non ancora implementato (solo log).
+void forwardParamToNode(const LwsFrame &f) {
+  if (f.len < 1) return;
+  char target = (char)f.data[0];
+
+  if (target == ID_ROUTER) {
+    // Il Router non ha parametri propri, ma conferma se REL
+    if ((char)f.cmd == CMD_PARAM_REL) {
+      sendParamAckToDisplayLws(f.seq, f.cmd);
+    }
+    return;
+  }
+
+  Stream *p = portForNode(target);
+  if (!p) {
+    Serial.printf("[LWS] param: unknown target %c\n", target);
+    return;
+  }
+
+  if (isLwsNode(target)) {
+    // Forward invariato: SENDER='D' (Display), SEQ=Display's seq.
+    // Il Teensy applichera' e rispondera' con ACK usando lo STESSO seq.
+    lws_send_frame(*p, f.sender, f.seq, f.cmd, f.data, f.len);
+  } else {
+    // Legacy: formato param verso nodi non ancora definito
+    Serial.printf("[LWS] param to legacy node %c dropped (not impl.)\n", target);
+    if ((char)f.cmd == CMD_PARAM_REL) {
+      // Best-effort: ACK per non far scadere il pending sul Display
+      sendParamAckToDisplayLws(f.seq, f.cmd);
+    }
+  }
+}
+#endif
+
+// ========================== LWS RX FROM DISPLAY ==========================
+#if ENABLE_LWS_V1
+void handleDisplayFrameLws(const LwsFrame& f) {
+  const char cmd = (char)f.cmd;
+
+  switch (cmd) {
+    case CMD_PING: {
+      char target = f.len > 0 ? (char)f.data[0] : ID_ROUTER;
+      forwardPingToNode(target);
+      break;
+    }
+
+    case CMD_PARAM:
+    case CMD_PARAM_REL: {
+      forwardParamToNode(f);
+      break;
+    }
+
+    case 'c':
+    case 'n':
+    case 'b':
+    case 's':
+    case 'e':
+    case 'a':
+    case CMD_PONG:
+    case CMD_PARAM_ACK:
+    default:
+      // Comandi non indirizzati al Router: ignora silenziosamente.
+      break;
+  }
+}
+#endif
+
+// ========================== LEGACY RX from Display (fallback) ==========================
 #if ENABLE_LEGACY_PROTO
 void handleDisplayInputLegacyByte(uint8_t b) {
   char p = (char)b;
@@ -273,60 +394,6 @@ void handleDisplayInputLegacyByte(uint8_t b) {
 }
 #endif
 
-// ========================== LWS RX FROM DISPLAY ==========================
-#if ENABLE_LWS_V1
-void handleDisplayFrameLws(const LwsFrame& f) {
-  const char cmd = (char)f.cmd;
-
-  switch (cmd) {
-    case CMD_PING: {
-      // Il Display include nel payload il nodo da interrogare.
-      char target = f.len > 0 ? (char)f.data[0] : ID_ROUTER;
-      if (target == ID_ROUTER) {
-        sendPongToDisplayLws(ID_ROUTER);
-      } else {
-        forwardPingToNodeLegacy(target);
-      }
-      break;
-    }
-
-    case CMD_PARAM: {
-      // Fire-and-forget: il Router non ha parametri propri, ma se il
-      // Display indirizza un param verso un nodo, lo inoltriamo via legacy.
-      // (Formato legacy per i param verso i nodi non e' ancora definito,
-      //  quindi per ora logghiamo soltanto.)
-      Serial.printf("[LWS] PARAM target=%c key=%c val=%u (dropped)\n",
-                    f.len >= 1 ? (char)f.data[0] : '?',
-                    f.len >= 2 ? (char)f.data[1] : '?',
-                    f.len >= 3 ? f.data[2] : 0);
-      break;
-    }
-
-    case CMD_PARAM_REL: {
-      // Reliable: il Router conferma con ACK (anche se non applica nulla).
-      Serial.printf("[LWS] PARAM_REL seq=%u target=%c key=%c val=%u\n",
-                    f.seq,
-                    f.len >= 1 ? (char)f.data[0] : '?',
-                    f.len >= 2 ? (char)f.data[1] : '?',
-                    f.len >= 3 ? f.data[2] : 0);
-      sendParamAckToDisplayLws(f.seq, f.cmd);
-      break;
-    }
-
-    case 'c':
-    case 'n':
-    case 'b':
-    case 's':
-    case 'e':
-    case 'a':
-    case CMD_PONG:
-    default:
-      // Comandi non indirizzati al Router: ignora.
-      break;
-  }
-}
-#endif
-
 void pollDisplayPort() {
   while (DISPLAY_PORT.available() > 0) {
     uint8_t b = (uint8_t)DISPLAY_PORT.read();
@@ -337,18 +404,58 @@ void pollDisplayPort() {
       handleDisplayFrameLws(f);
       continue;
     }
-    // NOTA: in LWSv1.1 il parser consuma il byte ad ogni chiamata e ritorna
-    // true solo a frame completo. Non c'e' modo di "ripescare" il byte per
-    // il legacy handler. Se hai bisogno del dual-mode reale, usa due porte
-    // separate o un flag di modalita' negoziato all'avvio.
+    // NOTA: in LWSv1.1 il parser consuma il byte ad ogni chiamata.
+    // Il path legacy sotto e' di fatto irraggiungibile quando il Display
+    // parla LWS. Tenuto per sicurezza durante la fase di migrazione.
+#endif
+
+#if ENABLE_LEGACY_PROTO
+    handleDisplayInputLegacyByte(b);
 #endif
   }
 }
 
-// ========================== NODES -> DISPLAY PONG ==========================
-// I nodi rispondono con protocollo legacy: 'p' + [sub_id?]
-// Il Router traduce in LWS PONG verso il Display, spoofando il SENDER
-// con l'ID del nodo che ha effettivamente risposto.
+// ========================== NODES -> DISPLAY (LWS BRIDGE) ==========================
+// Struttura di stato per ogni porta che parla LWS nativo.
+// Le porte ancora legacy NON vanno qui: usano handleNodePong().
+#if ENABLE_LWS_V1
+struct NodePort {
+  Stream*   s;
+  char      id;
+  LwsParser parser;
+};
+
+static NodePort nodePorts[] = {
+  // Migrati a LWS nativo:
+  { &SerialTeensy, ID_TEENSY, {} },
+  // Aggiungere qui Ctrl, Mod, Power, Synth... quando migrati.
+};
+static const size_t NODE_PORT_COUNT = sizeof(nodePorts) / sizeof(nodePorts[0]);
+
+// Legge le porte LWS, ricompone i frame e li inoltra al Display invariati.
+// I frame PONG, ACK, TIMELINE ecc. generati dai nodi arrivano al Display
+// come se fossero diretti, con SENDER = ID del nodo.
+static void pollNodePorts() {
+  for (size_t i = 0; i < NODE_PORT_COUNT; i++) {
+    NodePort &np = nodePorts[i];
+    while (np.s->available() > 0) {
+      uint8_t b = (uint8_t)np.s->read();
+      LwsFrame f;
+      if (np.parser.feed(b, f)) {
+        lws_send_frame(DISPLAY_PORT, f.sender, f.seq, f.cmd, f.data, f.len);
+        Serial.printf("[LWS] bridge %c -> D: cmd=%c len=%u\n",
+                      (char)f.sender, (char)f.cmd, f.len);
+      }
+    }
+  }
+}
+#endif
+
+// ========================== NODES LEGACY -> DISPLAY PONG ==========================
+// I nodi legacy rispondono con 'p' + [sub_id?] + '&!'.
+// Il Router li traduce in PONG LWS verso il Display.
+// NON va chiamata per le porte presenti in nodePorts[].
+#if ENABLE_LEGACY_PROTO
 void handleNodePong(Stream& node, char nodeId, const char* dbgName,
                     bool synthAHasSubId = false) {
   if (!node.available()) return;
@@ -374,6 +481,7 @@ void handleNodePong(Stream& node, char nodeId, const char* dbgName,
   (void)dbgName;
 #endif
 }
+#endif
 
 // ========================== SETUP / LOOP ==========================
 void setup() {
@@ -395,9 +503,9 @@ void setup() {
   SerialPower.begin(115200);
 
 #if ENABLE_LWS_V1
-  // Reset esplicito del parser e del contatore SEQ
   lwsParserDisplay.reset();
   lwsTxSeq = 0;
+  for (size_t i = 0; i < NODE_PORT_COUNT; i++) nodePorts[i].parser.reset();
 
   sendStatusToDisplayLws("Router boot (LWSv1.1)");
 #endif
@@ -408,16 +516,23 @@ void setup() {
 void loop() {
   MIDI.read();
 
-  // Input dal Display (LWS parser prioritario)
+  // --- Display -> Router/Nodi ---
   pollDisplayPort();
 
-  // Input dai nodi (legacy -> LWS PONG)
+  // --- Nodi LWS -> Display (bridge trasparente) ---
+#if ENABLE_LWS_V1
+  pollNodePorts();
+#endif
+
+  // --- Nodi legacy -> Display (PONG tradotto) ---
+#if ENABLE_LEGACY_PROTO
   handleNodePong(SerialSynthA, ID_SYNTH_A1, "SerialSynthA", true);
   handleNodePong(SerialSynthB, ID_SYNTH_B,  "SerialSynthB");
   handleNodePong(SerialCtrl,   ID_CTRL,     "SerialCtrl");
   handleNodePong(SerialMod,    ID_MOD,      "SerialMod");
-  handleNodePong(SerialTeensy, ID_TEENSY,   "SerialTeensy");
+  // SerialTeensy NON passa da qui: e' LWS nativo (in nodePorts[])
   handleNodePong(SerialPower,  ID_POWER,    "SerialPower");
+#endif
 
 #if ENABLE_LWS_V1
   // Heartbeat Router -> Display (1 Hz)
