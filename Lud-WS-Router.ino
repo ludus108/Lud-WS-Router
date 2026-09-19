@@ -1,8 +1,14 @@
 /*  Lud-WS Router ; Pi Pico 2 rp2350
-
-    V 0.0.3
-
+ *
+ *  V 0.0.4
+ *
  *  Bridge tra Display (LWSv1.1) e nodi.
+ *
+ *  Cambi principali rispetto a v0.0.3:
+ *    - Teensy spostato su UART hardware Serial1 (GP0/GP1) a 1 Mbps
+ *    - MIDI spostato su SerialPIO (GP12/GP13), era su Serial1
+ *    - SerialSynthB spostato su GP8/GP9 (era GP4/GP5, in conflitto con Serial2)
+ *    - Baud: LWS_BAUD=1Mbps su UART HW, NODE_BAUD=115200 su SerialPIO
  *
  *  Stato attuale:
  *    - Teensy      : LWSv1.1 nativo  -> bridged as-is verso il Display
@@ -20,11 +26,19 @@
 
 #include <Arduino.h>
 #include <MIDI.h>
-#include "serial_protocol.h"   // condiviso con Display, versione LWSv1.1
+
+// ---------------------------------------------------------------------
+// Config di sistema
+// ---------------------------------------------------------------------
+#define LWS_BAUD    1000000UL   // 1 Mbps — UART hardware (Teensy + Display)
+#define NODE_BAUD   115200UL    // SerialPIO verso nodi legacy
+
+#include "serial_protocol.h"    // condiviso con Display, versione LWSv1.1
 
 // Lud-WS-Router.ino
 #define MCU_ID 'R'
 #include "comunicazioni_mcu.h"
+
 // ========================== MCU IDS ==========================
 #define ID_DISPLAY  'D'
 #define ID_SYNTH_A1 'a'
@@ -48,24 +62,35 @@
 #define ENABLE_LEGACY_PROTO 1
 #define ENABLE_LWS_V1       1
 
-// UART mapping:
-//   Serial1 -> MIDI
-//   Serial2 -> Display
+// ========================== UART MAPPING ==========================
+// UART hardware (1 Mbps):
+//   Serial1 (UART0) -> Teensy      (GP0 TX / GP1 RX)
+//   Serial2 (UART1) -> Display     (GP4 TX / GP5 RX)
+//
+// SerialPIO (baud prudente):
+//   SerialSynthA -> GP2  TX / GP3  RX
+//   SerialCtrl   -> GP6  TX / GP7  RX
+//   SerialSynthB -> GP8  TX / GP9  RX
+//   SerialMod    -> GP10 TX / GP11 RX
+//   SerialMidi   -> GP12 TX / GP13 RX   (MIDI IN su RX)
+//   SerialPower  -> GP14 TX / GP15 RX
+// ==========================
 #define DISPLAY_PORT Serial2
+#define SerialTeensy Serial1     // NB: e' una UART hardware, non una SerialPIO
 
-// --- 6 porte SerialPIO verso i nodi ---
 SerialPIO SerialSynthA(2, 3);
-SerialPIO SerialSynthB(4, 5);
-SerialPIO SerialCtrl(6, 7);
-SerialPIO SerialMod(10, 11);
-SerialPIO SerialTeensy(12, 13);
-SerialPIO SerialPower(14, 15);
+SerialPIO SerialCtrl  (6, 7);
+SerialPIO SerialSynthB(8, 9);
+SerialPIO SerialMod   (10, 11);
+SerialPIO SerialMidi  (12, 13);
+SerialPIO SerialPower (14, 15);
 
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
+// MIDI IN su SerialPIO: 31250 baud, nessun carico significativo per la PIO.
+MIDI_CREATE_INSTANCE(SerialPIO, SerialMidi, MIDI);
 
 byte midi_SynthA_CH = 1;
 byte midi_SynthB_CH = 2;
-byte midi_Drum_CH = 3;
+byte midi_Drum_CH   = 3;
 
 // ========================== LWS STATE ==========================
 #if ENABLE_LWS_V1
@@ -115,7 +140,7 @@ void sendStatusToDisplayLws(const char* txt) {
 
 void sendErrorToDisplayLws(const char* txt) {
   uint8_t len = (uint8_t)min((int)strlen(txt), 250);
-  txLws(ID_ROUTER, 'e', (const uint8_t*)txt, len);
+  txLws(ID_ROUTER, CMD_ERROR, (const uint8_t*)txt, len);
 }
 
 void sendCCToDisplayLws(uint8_t cc, uint8_t val) {
@@ -264,7 +289,6 @@ void forwardPingToNodeLegacy(char nodeId) {
     case ID_SYNTH_B:
       SerialSynthB.write(CMD_PING);   SerialSynthB.write(ID_SYNTH_B); writeEnd(SerialSynthB);   break;
     case ID_ROUTER:
-      // Risposta diretta: e' il Router stesso
       sendPongToDisplayLegacy(ID_ROUTER);
 #if ENABLE_LWS_V1
       sendPongToDisplayLws(ID_ROUTER);
@@ -309,7 +333,6 @@ void forwardParamToNode(const LwsFrame &f) {
   char target = (char)f.data[0];
 
   if (target == ID_ROUTER) {
-    // Il Router non ha parametri propri, ma conferma se REL
     if ((char)f.cmd == CMD_PARAM_REL) {
       sendParamAckToDisplayLws(f.seq, f.cmd);
     }
@@ -327,7 +350,6 @@ void forwardParamToNode(const LwsFrame &f) {
     // Il Teensy applichera' e rispondera' con ACK usando lo STESSO seq.
     lws_send_frame(*p, f.sender, f.seq, f.cmd, f.data, f.len);
   } else {
-    // Legacy: formato param verso nodi non ancora definito
     Serial.printf("[LWS] param to legacy node %c dropped (not impl.)\n", target);
     if ((char)f.cmd == CMD_PARAM_REL) {
       // Best-effort: ACK per non far scadere il pending sul Display
@@ -359,7 +381,7 @@ void handleDisplayFrameLws(const LwsFrame& f) {
     case 'n':
     case 'b':
     case 's':
-    case 'e':
+    case CMD_ERROR:
     case 'a':
     case CMD_PONG:
     case CMD_PARAM_ACK:
@@ -405,9 +427,6 @@ void pollDisplayPort() {
       handleDisplayFrameLws(f);
       continue;
     }
-    // NOTA: in LWSv1.1 il parser consuma il byte ad ogni chiamata.
-    // Il path legacy sotto e' di fatto irraggiungibile quando il Display
-    // parla LWS. Tenuto per sicurezza durante la fase di migrazione.
 #endif
 
 #if ENABLE_LEGACY_PROTO
@@ -486,9 +505,11 @@ void handleNodePong(Stream& node, char nodeId, const char* dbgName,
 
 // ========================== SETUP / LOOP ==========================
 void setup() {
-  Serial.begin(115200);        // debug USB
-  DISPLAY_PORT.begin(115200);  // Display UART
+  Serial.begin(115200);              // USB debug
+  DISPLAY_PORT.begin(LWS_BAUD);      // UART1 hardware -> Display @ 1 Mbps
+  SerialTeensy.begin(LWS_BAUD);      // UART0 hardware -> Teensy  @ 1 Mbps
 
+  // MIDI su SerialPIO (MIDI.begin chiama internamente SerialMidi.begin(31250))
   MIDI.begin(MIDI_CHANNEL_OMNI);
   MIDI.turnThruOff();
   MIDI.setHandleNoteOn(handleNoteOn);
@@ -496,12 +517,12 @@ void setup() {
   MIDI.setHandleControlChange(handleControlChange);
   MIDI.setHandlePitchBend(handlePitchBend);
 
-  SerialSynthA.begin(115200);
-  SerialSynthB.begin(115200);
-  SerialCtrl.begin(115200);
-  SerialMod.begin(115200);
-  SerialTeensy.begin(115200);
-  SerialPower.begin(115200);
+  // Nodi legacy su SerialPIO (baud prudente)
+  SerialSynthA.begin(NODE_BAUD);
+  SerialSynthB.begin(NODE_BAUD);
+  SerialCtrl.begin(NODE_BAUD);
+  SerialMod.begin(NODE_BAUD);
+  SerialPower.begin(NODE_BAUD);
 
 #if ENABLE_LWS_V1
   lwsParserDisplay.reset();
@@ -511,7 +532,8 @@ void setup() {
   sendStatusToDisplayLws("Router boot (LWSv1.1)");
 #endif
 
-  Serial.println("[Router] LWSv1.1 ready");
+  Serial.println("[Router] LWSv1.1 ready  (Teensy@1Mbps, Display@1Mbps, "
+                 "SerialPIO@115200, MIDI@31250)");
 }
 
 void loop() {
