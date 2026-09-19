@@ -65,6 +65,7 @@ MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
 
 byte midi_SynthA_CH = 1;
 byte midi_SynthB_CH = 2;
+byte midi_Drum_CH = 3;
 
 // ========================== LWS STATE ==========================
 #if ENABLE_LWS_V1
