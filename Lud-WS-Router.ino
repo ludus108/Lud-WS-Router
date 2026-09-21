@@ -289,6 +289,23 @@ void handleDisplayFrameLws(const LwsFrame& f) {
       char target = f.len > 0 ? (char)f.data[0] : ID_ROUTER;
       forwardPingToNode(target);
       break;
+	      // ---------- PRESET TRANSFER (SynthA + SynthB) ----------
+    case CMD_PRESET_BEGIN:
+    case CMD_PRESET_CHUNK:
+    case CMD_PRESET_END:
+    case CMD_PRESET_READ:
+        forwardParamToNode(f);   // forward per target
+        break;
+
+    // ---------- PRESET ACK/DUMP (dai nodi al Display) ----------
+    case CMD_PRESET_ACK:
+    case CMD_PRESET_DUMP_BEGIN:
+    case CMD_PRESET_DUMP_CHUNK:
+    case CMD_PRESET_DUMP_END:
+        // Questi sono destinati al Display: il Router li forwarda nel
+        // bridge nodi→Display automaticamente (pollNodePorts).
+        // Non serve gestirli qui nel dispatch del Display.
+        break;
     }
 
     // ---------- PARAM standard + estesi SynthA ----------
