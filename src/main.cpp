@@ -77,6 +77,15 @@
 #define DISPLAY_PORT Serial2
 #define SerialTeensy Serial1
 
+// ========================== STATISTICHE PER DUMP ==========================
+static uint32_t g_frameFromDisplay = 0;   // frame LWS ricevuti dal Display
+static uint32_t g_frameFromNodes   = 0;   // frame LWS dai nodi (bridge → Display)
+static uint32_t g_legacyFromDisplay = 0;  // byte legacy dal Display
+static uint32_t g_midiMessages     = 0;   // messaggi MIDI hardware ricevuti
+static uint32_t g_pongCount[4]     = {0, 0, 0, 0};  // 0=SynthB, 1=Ctrl, 2=Mod, 3=Power
+// Contatori per dump status
+static uint32_t g_pongCount[4] = {0, 0, 0, 0};  // 0=SynthB, 1=Ctrl, 2=Mod, 3=Power
+
 SerialPIO SerialSynthA(2, 3);
 SerialPIO SerialCtrl  (6, 7);
 SerialPIO SerialSynthB(8, 9);
@@ -281,9 +290,12 @@ static void forwardMidiVToSynthA(const LwsFrame& f) {
 // ========================== LWS RX FROM DISPLAY ==========================
 void handleDisplayFrameLws(const LwsFrame& f) {
   const char cmd = (char)f.cmd;
-
+g_frameFromDisplay++;
   switch (cmd) {
-
+    // ---------- DUMP STATUS ----------
+    case '?':
+      dumpStatus();
+      break;
     // ---------- PING ----------
     case CMD_PING: {
       char target = f.len > 0 ? (char)f.data[0] : ID_ROUTER;
@@ -369,7 +381,9 @@ void pollDisplayPort() {
 
 #if ENABLE_LEGACY_PROTO
     handleDisplayInputLegacyByte(b);
+	g_legacyFromDisplay++;
 #endif
+
   }
 }
 
@@ -397,6 +411,7 @@ static void pollNodePorts() {
       uint8_t b = (uint8_t)np.s->read();
       LwsFrame f;
       if (np.parser.feed(b, f)) {
+		  g_frameFromNodes++;
         lws_send_frame(DISPLAY_PORT, f.sender, f.seq, f.cmd, f.data, f.len);
         Serial.printf("[LWS] bridge %c -> D: cmd=%c len=%u\n",
                       (char)f.sender, (char)f.cmd, f.len);
@@ -540,11 +555,52 @@ void handleNodePong(Stream& node, char nodeId, const char* dbgName,
 
 #if ENABLE_LWS_V1
   sendPongToDisplayLws(who);
+  if      (nodeId == ID_SYNTH_B) g_pongCount[0]++;
+else if (nodeId == ID_CTRL)    g_pongCount[1]++;
+else if (nodeId == ID_MOD)     g_pongCount[2]++;
+else if (nodeId == ID_POWER)   g_pongCount[3]++;
+ 
   (void)dbgName;
 #endif
 }
 #endif
+void dumpStatus() {
+    // ===== HEADER =====
+    Serial.println();
+    Serial.println("[DUMP] ========== ROUTER STATUS ==========");
+    Serial.printf("[DUMP] fw=V 0.0.5\n");
+    Serial.printf("[DUMP] mcu=%c uptime=%lu ms\n", MCU_ID, millis());
 
+    // ===== TRAFFICO LWS =====
+    Serial.println("[DUMP] --- TRAFFIC ---");
+    Serial.printf("[DUMP] lws_tx_seq=%u\n", lwsTxSeq);
+    Serial.printf("[DUMP] frame_display->router=%lu\n", g_frameFromDisplay);
+    Serial.printf("[DUMP] frame_nodes->router=%lu\n", g_frameFromNodes);
+    Serial.printf("[DUMP] legacy_bytes_display=%lu\n", g_legacyFromDisplay);
+    Serial.printf("[DUMP] midi_messages=%lu\n", g_midiMessages);
+
+    // ===== NODI LWS (parser attivi) =====
+    Serial.println("[DUMP] --- LWS NODES ---");
+    for (size_t i = 0; i < NODE_PORT_COUNT; i++) {
+        Serial.printf("[DUMP]   node_%c=active\n", nodePorts[i].id);
+    }
+
+    // ===== NODI LEGACY (contatori pong) =====
+    Serial.println("[DUMP] --- LEGACY NODES ---");
+    Serial.printf("[DUMP]   pong_SynthB=%lu\n", g_pongCount[0]);
+    Serial.printf("[DUMP]   pong_Ctrl=%lu\n",   g_pongCount[1]);
+    Serial.printf("[DUMP]   pong_Mod=%lu\n",    g_pongCount[2]);
+    Serial.printf("[DUMP]   pong_Power=%lu\n",  g_pongCount[3]);
+
+    // ===== MIDI CONFIG =====
+    Serial.println("[DUMP] --- MIDI ---");
+    Serial.printf("[DUMP] ch_SynthA=%u ch_SynthB=%u ch_Drum=%u\n",
+                  midi_SynthA_CH, midi_SynthB_CH, midi_Drum_CH);
+
+    // ===== FOOTER =====
+    Serial.println("[DUMP] ==========================================");
+    Serial.println();
+}
 // ========================== SETUP / LOOP ==========================
 void setup() {
   Serial.begin(115200);                  // USB debug
@@ -577,8 +633,12 @@ void setup() {
 }
 
 void loop() {
-  MIDI.read();
-
+  // (MIDI.read() restituisce true se c'è stato un messaggio)
+if (MIDI.read()) g_midiMessages++;
+if (Serial.available()) {
+    char c = Serial.read();
+    if (c == '?') dumpStatus();
+}
   // Display → Router → Nodi
   pollDisplayPort();
 
