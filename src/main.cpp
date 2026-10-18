@@ -83,8 +83,9 @@ static uint32_t g_frameFromNodes   = 0;   // frame LWS dai nodi (bridge → Disp
 static uint32_t g_legacyFromDisplay = 0;  // byte legacy dal Display
 static uint32_t g_midiMessages     = 0;   // messaggi MIDI hardware ricevuti
 static uint32_t g_pongCount[4]     = {0, 0, 0, 0};  // 0=SynthB, 1=Ctrl, 2=Mod, 3=Power
-// Contatori per dump status
-static uint32_t g_pongCount[4] = {0, 0, 0, 0};  // 0=SynthB, 1=Ctrl, 2=Mod, 3=Power
+
+// Forward declaration per trigger '?' in handleDisplayFrameLws
+void dumpStatus();
 
 SerialPIO SerialSynthA(2, 3);
 SerialPIO SerialCtrl  (6, 7);
